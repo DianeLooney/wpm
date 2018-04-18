@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,16 +18,16 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
-type Manifest struct {
+type Config struct {
 	Installations []Installation
 }
 
 type Installation struct {
 	Dir    string
-	Addons []*Spec
+	Addons []*Specification
 }
 
-type Spec struct {
+type Specification struct {
 	Name     string
 	Type     string
 	Location string `yaml:",omitempty"`
@@ -38,66 +39,131 @@ type Spec struct {
 
 var errFileNotFound = fmt.Errorf("wpm: file not found")
 var errFileFormat = fmt.Errorf("wpm: file not formatted correctly")
+var defaultInstallLocation = `C:\Program Files (x86)\World of Warcraft\Interface\AddOns`
 
-func readManifest() (*Manifest, error) {
-	ad := os.Getenv("APPDATA")
-	wpm := path.Join(ad, "wpm.yaml")
-	d, err := ioutil.ReadFile(wpm)
+func wpmLocation() string {
+	return path.Join(os.Getenv("APPDATA"), "wpm", "wpm.yaml")
+}
+
+func readConfig() (*Config, error) {
+	loc := wpmLocation()
+	d, err := ioutil.ReadFile(loc)
 	if err != nil {
 		return nil, errFileNotFound
 	}
-	m := Manifest{}
-	err = yaml.Unmarshal(d, &m)
+	cfg := Config{}
+	err = yaml.Unmarshal(d, &cfg)
 	if err != nil {
 		return nil, errFileFormat
 	}
-	return &m, nil
+	return &cfg, nil
 }
+func saveConfig(c *Config) error {
+	d, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("Internal error: unable to create yaml: %v\n", err)
+	}
+	wpm := wpmLocation()
+	return ioutil.WriteFile(wpm, d, 0644)
+}
+
 func main() {
+	if len(os.Args) < 2 {
+		/*
+			fmt.Println("wpm commands:")
+			fmt.Println("\twpm init")
+			fmt.Println("\t\tcreates a wpm.yaml config file located in APPDATA")
+			fmt.Println("\twpm list [-path=\"path\"]")
+			fmt.Println("\t\tlists all of the installed addons")
+			fmt.Println("\t\tif supplied with a path, will list only that installations addons")
+			fmt.Println("\twpm add [-i=path] -n=name -t=curse|wowace|ignore")
+			fmt.Println("\t\tadds the addon to wpm.yaml config")
+			fmt.Println("\twpm upgrade [-purge] [-clean]")
+		*/
+	}
 	args := os.Args[1:]
 	switch args[0] {
 	case "init":
-		i := Installation{}
-		d, err := yaml.Marshal(i)
-		if err != nil {
-			log.Fatalf("Internal error: unable to create yaml: %v\n", err)
-		}
-		ad := os.Getenv("APPDATA")
-		wpm := path.Join(ad, "wpm.yaml")
-		err = ioutil.WriteFile(wpm, d, 0644)
+		cfg := Config{}
+		cfg.Installations = make([]Installation, 1)
+		cfg.Installations[0].Dir = defaultInstallLocation
+		cfg.Installations[0].Addons = make([]*Specification, 0)
+		err := saveConfig(&cfg)
 		if err != nil {
 			log.Fatalf("Unable to write to file: %v\n", err)
 		}
 	case "list":
-		m, err := readManifest()
+		cfg, err := readConfig()
 		if err != nil {
 			log.Fatalf("Unable to load wpm.yaml: %v\n", err)
 		}
-		d, _ := yaml.Marshal(m)
-		fmt.Printf("%s\n", d)
+		fset := flag.NewFlagSet("list args", flag.ContinueOnError)
+		f := fset.String("p", defaultInstallLocation, "will list only that installations addons")
+		fset.Parse(args[1:])
+		if f == nil || *f == "" {
+			d, _ := yaml.Marshal(cfg)
+			fmt.Printf("%s\n", d)
+			return
+		}
+		for _, i := range cfg.Installations {
+			if i.Dir != *f {
+				continue
+			}
+			d, _ := yaml.Marshal(i)
+			fmt.Printf("%s\n", d)
+			return
+		}
+		fmt.Printf("No installations handled at '%v'\n", *f)
 	case "add":
-		log.Fatalf("Not yet implemented")
-	case "upgrade":
-		m, err := readManifest()
+		cfg, err := readConfig()
 		if err != nil {
 			log.Fatalf("Unable to load wpm.yaml: %v\n", err)
 		}
-		//mtx := sync.Mutex{}
+
+		fset := flag.NewFlagSet("list args", flag.ContinueOnError)
+		pth := fset.String("i", cfg.Installations[0].Dir, "chooses installation location")
+		n := fset.String("n", "", "name")
+		t := fset.String("t", "", "type")
+		l := fset.String("l", "", "location")
+		fset.Parse(args[1:])
+
+		for i, v := range cfg.Installations {
+			if v.Dir != *pth {
+				continue
+			}
+			cfg.Installations[i].Addons = append(v.Addons, &Specification{
+				Name:     *n,
+				Type:     *t,
+				Location: *l,
+			})
+		}
+
+		saveConfig(cfg)
+		if err != nil {
+			log.Fatalf("Unable to write to file: %v\n", err)
+		}
+	case "upgrade":
+		m, err := readConfig()
+		if err != nil {
+			log.Fatalf("Unable to load wpm.yaml: %v\n", err)
+		}
+
 		wg := sync.WaitGroup{}
 		wg.Add(len(m.Installations[0].Addons))
-		for i, adn := range m.Installations[0].Addons {
-			go func(i int, adn *Spec) {
+		for _, adn := range m.Installations[0].Addons {
+			go func(adn *Specification) {
 				defer wg.Done()
 				adn.Download()
-			}(i, adn)
+			}(adn)
 		}
 		wg.Wait()
-		//check for conflicts
+
+		//todo: check for conflicts
 
 		wg = sync.WaitGroup{}
 		for _, adn := range m.Installations[0].Addons {
 			wg.Add(1)
-			go func(adn *Spec) {
+			go func(adn *Specification) {
 				defer wg.Done()
 				delta := adn.PlanChanges(m.Installations[0].Dir)
 				for _, d := range delta {
@@ -106,46 +172,7 @@ func main() {
 			}(adn)
 		}
 		wg.Wait()
-
 	}
-}
-
-type change interface {
-	commit() error
-}
-
-type removeAll struct {
-	loc string
-}
-
-func (a removeAll) commit() error {
-	return os.RemoveAll(a.loc)
-}
-
-type remove struct {
-	loc string
-}
-
-func (a remove) commit() error {
-	return os.Remove(a.loc)
-}
-
-type addDir struct {
-	loc string
-}
-
-func (a addDir) commit() error {
-	return os.Mkdir(a.loc, 0666)
-}
-
-type addFile struct {
-	loc  string
-	data io.Reader
-}
-
-func (a addFile) commit() error {
-	data, _ := ioutil.ReadAll(a.data)
-	return ioutil.WriteFile(a.loc, data, 0644)
 }
 
 type pack struct {
@@ -153,7 +180,7 @@ type pack struct {
 	data    *zip.Reader
 }
 
-func (sp *Spec) Download() {
+func (sp *Specification) Download() {
 	switch sp.Type {
 	case "curse":
 		fallthrough
@@ -221,10 +248,12 @@ func (sp *Spec) Download() {
 		}
 	case "ignore":
 		sp.ownDirs = []string{sp.Name}
-		//do nothing to it
+	case "link":
+		sp.ownDirs = []string{sp.Name}
 	}
 }
-func (sp *Spec) PlanChanges(base string) []change {
+
+func (sp *Specification) PlanChanges(base string) []commiter {
 	switch sp.Type {
 	case "curse":
 		fallthrough
@@ -232,7 +261,7 @@ func (sp *Spec) PlanChanges(base string) []change {
 		dirs := make(map[string]bool)
 		if sp.zipData == nil {
 			fmt.Println("nil data")
-			return make([]change, 0)
+			return make([]commiter, 0)
 		}
 		for _, f := range sp.zipData.File {
 			pth := path.Dir(f.Name)
@@ -248,23 +277,77 @@ func (sp *Spec) PlanChanges(base string) []change {
 			i++
 		}
 		sort.Strings(dirSl)
-		retval := make([]change, 0)
+		retval := make([]commiter, 0)
 		for _, d := range sp.ownDirs {
-			retval = append(retval, removeAll{path.Join(base, d)})
+			retval = append(retval, fsRmdir{path.Join(base, d)})
 		}
 		for _, s := range dirSl {
-			retval = append(retval, addDir{path.Join(base, s)})
+			retval = append(retval, fsMkdir{path.Join(base, s)})
 		}
 		for _, f := range sp.zipData.File {
 			if f.FileInfo().IsDir() {
 				continue
 			}
 			rd, _ := f.Open()
-			retval = append(retval, addFile{path.Join(base, f.Name), rd})
+			retval = append(retval, fsWritefile{path.Join(base, f.Name), rd})
 		}
 		return retval
 	case "ignore":
-		return make([]change, 0)
+		return make([]commiter, 0)
+	case "link":
+		ret := make([]commiter, 2)
+		ret[0] = fsRmdir{path.Join(base, sp.Name)}
+		ret[1] = fsLink{sp.Location, path.Join(base, sp.Name)}
+		return ret
 	}
-	return make([]change, 0)
+	return make([]commiter, 0)
+}
+
+// Commiters
+
+type commiter interface {
+	commit() error
+}
+
+type fsRmdir struct {
+	loc string
+}
+
+func (a fsRmdir) commit() error {
+	return os.RemoveAll(a.loc)
+}
+
+type fsRm struct {
+	loc string
+}
+
+func (a fsRm) commit() error {
+	return os.Remove(a.loc)
+}
+
+type fsMkdir struct {
+	loc string
+}
+
+func (a fsMkdir) commit() error {
+	return os.Mkdir(a.loc, 0666)
+}
+
+type fsWritefile struct {
+	loc  string
+	data io.Reader
+}
+
+func (f fsWritefile) commit() error {
+	data, _ := ioutil.ReadAll(f.data)
+	return ioutil.WriteFile(f.loc, data, 0644)
+}
+
+type fsLink struct {
+	src string
+	dst string
+}
+
+func (f fsLink) commit() error {
+	return os.Link(f.src, f.dst)
 }
